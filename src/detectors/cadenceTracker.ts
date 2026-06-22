@@ -1,93 +1,115 @@
 import * as vscode from 'vscode';
+import { CADENCE, STORAGE_KEYS } from '../constants';
 
-interface TypingEvent {
-	timestamp: number;
-	linesAdded: number;
-	charsAdded: number;
+interface LanguageBaseline {
+	medianMs: number;
+	madMs: number;      // median absolute deviation — robust spread
+	samples: number;
+	updatedAt: number;
 }
 
-interface UserBaseline {
-	avgIntervalMs: number;
-	totalSessions: number;
-	lastUpdated: number;
+interface PersistedBaselines {
+	[languageId: string]: LanguageBaseline;
 }
 
+/**
+ * Tracks the user's typing rhythm per language and exposes a single
+ * `isSuspiciouslyFast` signal. Uses median + MAD rather than mean +
+ * stdev so a few long pauses or instant accepts don't poison the baseline.
+ *
+ * Intentionally ignores edits whose `charsAdded` exceeds the configured
+ * keystroke cutoff — those are pastes, snippet expansions, or autocomplete
+ * acceptances and must not enter the baseline.
+ */
 export class CadenceTracker {
-	private typingHistory: TypingEvent[] = [];
-	private lastKeystrokeTime: number = 0;
-	private intervals: number[] = [];
-	private context: vscode.ExtensionContext;
+	private intervalsByLang = new Map<string, number[]>();
+	private lastKeystrokeByLang = new Map<string, number>();
+	private baselines: PersistedBaselines;
+	private dirty = false;
 
-	// How many intervals we keep in memory
-	private readonly MAX_INTERVALS = 100;
-
-	constructor(context: vscode.ExtensionContext) {
-		this.context = context;
+	constructor(private readonly context: vscode.ExtensionContext) {
+		this.baselines = context.globalState.get<PersistedBaselines>(STORAGE_KEYS.cadenceBaselines) ?? {};
 	}
 
-	// Called every time a text change happens
-	public track(linesAdded: number, charsAdded: number): void {
+	track(languageId: string, charsAdded: number, charsRemoved: number): void {
+		// Non-keystroke edits never feed the baseline. Backspaces (removed > 0,
+		// added 0) are evidence of human editing but don't have a meaningful
+		// inter-keystroke interval, so we just refresh the timestamp.
 		const now = Date.now();
+		const isLikelyKeystroke = charsAdded > 0 && charsAdded <= CADENCE.maxCharsPerKeystroke;
+		const isBackspace = charsAdded === 0 && charsRemoved > 0 && charsRemoved <= CADENCE.maxCharsPerKeystroke;
 
-		// Only track single character additions (actual typing)
-		// not pastes (we handle those separately)
-		if (charsAdded <= 2 && this.lastKeystrokeTime !== 0) {
-			const interval = now - this.lastKeystrokeTime;
-
-			// Ignore intervals over 5 seconds (user was just thinking/pausing)
-			if (interval < 5000) {
-				this.intervals.push(interval);
-
-				// Keep only the last N intervals
-				if (this.intervals.length > this.MAX_INTERVALS) {
-					this.intervals.shift();
-				}
-			}
+		if (!isLikelyKeystroke && !isBackspace) {
+			// Big insertion (paste / autocomplete) — reset the last-keystroke timer
+			// so the next genuine keystroke doesn't compute a bogus interval.
+			this.lastKeystrokeByLang.delete(languageId);
+			return;
 		}
 
-		this.lastKeystrokeTime = now;
+		const prev = this.lastKeystrokeByLang.get(languageId);
+		this.lastKeystrokeByLang.set(languageId, now);
+		if (prev === undefined || !isLikelyKeystroke) {return;}
 
-		// Save a typing event
-		this.typingHistory.push({ timestamp: now, linesAdded, charsAdded });
+		const interval = now - prev;
+		if (interval <= 0 || interval > CADENCE.maxIntervalMs) {return;}
 
-		// Update the baseline every 50 keystrokes
-		if (this.intervals.length > 0 && this.intervals.length % 50 === 0) {
-			this.saveBaseline();
+		const arr = this.intervalsByLang.get(languageId) ?? [];
+		arr.push(interval);
+		if (arr.length > CADENCE.windowSize) {arr.shift();}
+		this.intervalsByLang.set(languageId, arr);
+
+		// Update baselines periodically.
+		if (arr.length >= CADENCE.minSamplesForBaseline && arr.length % 25 === 0) {
+			this.updateBaseline(languageId, arr);
 		}
 	}
 
-	// Calculate average interval between keystrokes
-	public getAverageInterval(): number {
-		if (this.intervals.length === 0) return 0;
-		const sum = this.intervals.reduce((a, b) => a + b, 0);
-		return sum / this.intervals.length;
+	isSuspiciouslyFast(languageId: string): boolean {
+		const arr = this.intervalsByLang.get(languageId) ?? [];
+		if (arr.length < CADENCE.minSamplesForBaseline) {return false;}
+
+		const baseline = this.baselines[languageId];
+		if (!baseline) {return false;}
+
+		// Use the most recent third of the window as the "current" tempo so a
+		// recent burst stands out against the baseline median.
+		const recent = arr.slice(-Math.max(10, Math.floor(arr.length / 3)));
+		const currentMedian = median(recent);
+
+		return currentMedian > 0 && currentMedian * CADENCE.fastMultiplier < baseline.medianMs;
 	}
 
-	// Save baseline to persistent storage
-	private saveBaseline(): void {
-		const baseline: UserBaseline = {
-			avgIntervalMs: this.getAverageInterval(),
-			totalSessions: (this.getBaseline()?.totalSessions || 0) + 1,
-			lastUpdated: Date.now()
+	flush(): void {
+		if (this.dirty) {
+			void this.context.globalState.update(STORAGE_KEYS.cadenceBaselines, this.baselines);
+			this.dirty = false;
+		}
+	}
+
+	private updateBaseline(languageId: string, intervals: number[]): void {
+		const m = median(intervals);
+		const mad = medianAbsoluteDeviation(intervals, m);
+		this.baselines[languageId] = {
+			medianMs: m,
+			madMs: mad,
+			samples: intervals.length,
+			updatedAt: Date.now(),
 		};
-		this.context.globalState.update('userBaseline', baseline);
-		console.log('Baseline saved:', baseline);
+		this.dirty = true;
+		this.flush();
 	}
+}
 
-	// Get saved baseline from storage
-	public getBaseline(): UserBaseline | undefined {
-		return this.context.globalState.get<UserBaseline>('userBaseline');
-	}
+// --- Pure stats helpers (exported for tests) -------------------------------
 
-	// Check if current typing speed is suspiciously fast
-	public isSuspiciouslyFast(): boolean {
-		const baseline = this.getBaseline();
-		const currentAvg = this.getAverageInterval();
+export function median(values: number[]): number {
+	if (values.length === 0) {return 0;}
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = sorted.length >> 1;
+	return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
 
-		// Not enough data yet to compare
-		if (!baseline || this.intervals.length < 10) return false;
-
-		// If current speed is 3x faster than their baseline — suspicious
-		return currentAvg < baseline.avgIntervalMs / 3;
-	}
+export function medianAbsoluteDeviation(values: number[], med = median(values)): number {
+	if (values.length === 0) {return 0;}
+	return median(values.map(v => Math.abs(v - med)));
 }

@@ -13,36 +13,51 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-        {
-            "command": "ai-footprint.showDashboard",
-            "title": "AI Footprint: Show Dashboard"
-        }
+      { "command": "ai-footprint.showDashboard", "title": "AI Footprint: Show Dashboard" },
+      { "command": "ai-footprint.snooze30",      "title": "AI Footprint: Snooze Nudges for 30 Minutes" },
+      { "command": "ai-footprint.exportData",    "title": "AI Footprint: Export Data" },
+      { "command": "ai-footprint.clearData",     "title": "AI Footprint: Clear All Data" }
     ],
     "configuration": {
-        "title": "AI Footprint",
-        "properties": {
-            "aiFootprint.pasteThreshold": {
-                "type": "number",
-                "default": 5,
-                "minimum": 3,
-                "maximum": 50,
-                "description": "Number of lines pasted at once to trigger detection"
-            },
-            "aiFootprint.cooldownMinutes": {
-                "type": "number",
-                "default": 5,
-                "minimum": 1,
-                "maximum": 60,
-                "description": "Minutes between nudges to avoid interrupting your flow"
-            },
-            "aiFootprint.enabled": {
-                "type": "boolean",
-                "default": true,
-                "description": "Enable or disable AI Footprint monitoring"
-            }
+      "title": "AI Footprint",
+      "properties": {
+        "aiFootprint.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable AI Footprint monitoring."
+        },
+        "aiFootprint.pasteThreshold": {
+          "type": "number",
+          "default": 5,
+          "minimum": 3,
+          "maximum": 200,
+          "description": "Number of lines added at once before an edit is classified as a paste."
+        },
+        "aiFootprint.cooldownMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 240,
+          "description": "Minimum minutes between nudges."
+        },
+        "aiFootprint.clipboardAware": {
+          "type": "boolean",
+          "default": true,
+          "description": "Cross-check insertions against the OS clipboard for more accurate paste detection."
+        },
+        "aiFootprint.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the live AI Footprint score in the status bar."
+        },
+        "aiFootprint.quietWhileDebugging": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suppress nudges while a debug session is active."
         }
+      }
     }
-},
+  },
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
