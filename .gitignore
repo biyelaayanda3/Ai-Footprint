@@ -3,3 +3,6 @@ dist
 node_modules
 .vscode-test/
 *.vsix
+
+# Local AI agent / Claude Code harness state (per-machine permissions, etc.)
+.claude/
